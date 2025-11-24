@@ -18,15 +18,15 @@ package raft
 //
 
 import (
+	"bytes"
 	"crypto/rand"
+	"encoding/gob"
 	"labrpc"
 	"math/big"
 	"sync"
 	"time"
 )
 
-// import "bytes"
-// import "encoding/gob"
 // iota is a counter used to make const work as a enum
 
 const (
@@ -80,16 +80,17 @@ type Raft struct {
 	state           int         //Follower, Candidate or Leader
 	electionTimer   *time.Timer //Timer for the election
 	heartbeatPeriod time.Duration
+
+	applyCh     chan ApplyMsg
+	applierCond *sync.Cond
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
-	// Your code here (2A).
-	return term, isleader
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.currentTerm, rf.state == Leader
 }
 
 func (rf *Raft) killed() bool {
@@ -105,26 +106,33 @@ func (rf *Raft) killed() bool {
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
 func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := gob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := gob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := gob.NewDecoder(r)
-	// d.Decode(&rf.xxx)
-	// d.Decode(&rf.yyy)
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
+	}
+	r := bytes.NewBuffer(data)
+	d := gob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var log []LogEntry
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&log) != nil {
+		// Error handling? For now just ignore or log
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = log
 	}
 }
 
@@ -132,7 +140,7 @@ func (rf *Raft) readPersist(data []byte) {
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	Term         int //candidated's term
-	Candidateld  int //candidate requesting vote
+	CandidateId  int //candidate requesting vote
 	LastLogIndex int //index of candidate's last log entry
 	LastLogTerm  int //term of candidate's last log entry
 }
@@ -154,15 +162,16 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term   int  //currentTerm, for leader to update itself
-	Sucess bool //true if follower contained entry matching PrevLogIndex and PrevLogTerm
+	Term          int  //currentTerm, for leader to update itself
+	Sucess        bool //true if follower contained entry matching PrevLogIndex and PrevLogTerm
+	ConflictIndex int
+	ConflictTerm  int
 }
 
 //Métodos de manipulação de RPCs
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -179,9 +188,20 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.becomeFollower(args.Term)
 	}
 
-	//if not voted or voted in the same candidate
-	if rf.votedFor == -1 || rf.votedFor == args.Candidateld {
-		rf.votedFor = args.Candidateld
+	// Check if candidate's log is at least as up-to-date as ours
+	lastLogIndex := len(rf.log) - 1
+	lastLogTerm := rf.log[lastLogIndex].Term
+
+	upToDate := false
+	if args.LastLogTerm > lastLogTerm {
+		upToDate = true
+	} else if args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex {
+		upToDate = true
+	}
+
+	//if not voted or voted in the same candidate, and candidate's log is up-to-date
+	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && upToDate {
+		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
 		rf.resetElectionTimer()
 	}
@@ -206,15 +226,51 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.becomeFollower(args.Term)
 	}
 
-	if args.Term == rf.currentTerm {
-		// if the term is equal, candidate reverts to follower
-		rf.resetElectionTimer()
-		reply.Sucess = true
+	// 2. Reply false if log doesn't contain an entry at PrevLogIndex whose term matches PrevLogTerm
+	if args.PrevLogIndex >= len(rf.log) {
+		reply.ConflictIndex = len(rf.log)
+		reply.ConflictTerm = -1
+		return
+	}
+	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
+		for i := args.PrevLogIndex; i >= 0; i-- {
+			if rf.log[i].Term == reply.ConflictTerm {
+				reply.ConflictIndex = i
+			} else {
+				break
+			}
+		}
+		return
 	}
 
-	rf.resetElectionTimer()
+	// 3. If an existing entry conflicts with a new one (same index but different terms),
+	// delete the existing entry and all that follow it
+	// 4. Append any new entries not already in the log
+	for i, entry := range args.Entries {
+		idx := args.PrevLogIndex + 1 + i
+		if idx < len(rf.log) {
+			if rf.log[idx].Term != entry.Term {
+				rf.log = rf.log[:idx]
+				rf.log = append(rf.log, entry)
+			}
+		} else {
+			rf.log = append(rf.log, entry)
+		}
+	}
+	rf.persist()
 
-	// if RPC reached this point, the term is valid and the heartbeat is valid too
+	// 5. If LeaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
+	if args.LeaderCommit > rf.commitIndex {
+		lastNewEntryIndex := args.PrevLogIndex + len(args.Entries)
+		if args.LeaderCommit < lastNewEntryIndex {
+			rf.commitIndex = args.LeaderCommit
+		} else {
+			rf.commitIndex = lastNewEntryIndex
+		}
+		rf.applierCond.Broadcast()
+	}
+
 	reply.Sucess = true
 }
 
@@ -262,9 +318,14 @@ func (rf *Raft) startElection() {
 	rf.persist()
 	rf.resetElectionTimer()
 
+	lastLogIndex := len(rf.log) - 1
+	lastLogTerm := rf.log[lastLogIndex].Term
+
 	args := RequestVoteArgs{
-		Term:        rf.currentTerm,
-		Candidateld: rf.me,
+		Term:         rf.currentTerm,
+		CandidateId:  rf.me,
+		LastLogIndex: lastLogIndex,
+		LastLogTerm:  lastLogTerm,
 	}
 
 	votes := 1
@@ -341,9 +402,6 @@ func (rf *Raft) becomeFollower(term int) {
 }
 
 func (rf *Raft) becomeLeader() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
 	if rf.state != Candidate {
 		return
 	}
@@ -406,10 +464,27 @@ func (rf *Raft) sendAppendEntries() {
 			continue
 		}
 
+		// Calculate PrevLogIndex and PrevLogTerm
+		nextIdx := rf.nextIndex[i]
+		prevLogIndex := nextIdx - 1
+		prevLogTerm := 0
+		if prevLogIndex >= 0 {
+			prevLogTerm = rf.log[prevLogIndex].Term
+		}
+
+		// Prepare entries to send
+		entries := make([]LogEntry, 0)
+		if nextIdx < len(rf.log) {
+			entries = append(entries, rf.log[nextIdx:]...)
+		}
+
 		args := AppendEntriesArgs{
-			Term:     currentTerm,
-			LeaderId: leaderId,
-			Entries:  []LogEntry{},
+			Term:         currentTerm,
+			LeaderId:     leaderId,
+			PrevLogIndex: prevLogIndex,
+			PrevLogTerm:  prevLogTerm,
+			Entries:      entries,
+			LeaderCommit: rf.commitIndex,
 		}
 
 		go func(server int) {
@@ -429,6 +504,67 @@ func (rf *Raft) sendAppendEntries() {
 				if reply.Term > rf.currentTerm {
 					rf.becomeFollower(reply.Term)
 					return
+				}
+
+				if reply.Sucess {
+					// Update nextIndex and matchIndex
+					newNextIndex := args.PrevLogIndex + len(args.Entries) + 1
+					newMatchIndex := args.PrevLogIndex + len(args.Entries)
+
+					if newNextIndex > rf.nextIndex[server] {
+						rf.nextIndex[server] = newNextIndex
+					}
+					if newMatchIndex > rf.matchIndex[server] {
+						rf.matchIndex[server] = newMatchIndex
+					}
+
+					// Update commitIndex
+					// If there exists an N such that N > commitIndex, a majority of matchIndex[i] ≥ N,
+					// and log[N].term == currentTerm: set commitIndex = N
+					for N := len(rf.log) - 1; N > rf.commitIndex; N-- {
+						count := 1 // Count self
+						for j := 0; j < peers; j++ {
+							if j != rf.me && rf.matchIndex[j] >= N {
+								count++
+							}
+						}
+						if count > peers/2 && rf.log[N].Term == rf.currentTerm {
+							rf.commitIndex = N
+							rf.applierCond.Broadcast()
+							break
+						}
+					}
+
+				} else {
+					// Ignore stale conflict responses
+					if args.PrevLogIndex != rf.nextIndex[server]-1 {
+						return
+					}
+
+					// Fast backup optimization
+					if reply.ConflictTerm == -1 {
+						rf.nextIndex[server] = reply.ConflictIndex
+					} else {
+						// Find the last entry in leader's log with ConflictTerm
+						lastEntryWithConflictTerm := -1
+						for i := len(rf.log) - 1; i >= 0; i-- {
+							if rf.log[i].Term == reply.ConflictTerm {
+								lastEntryWithConflictTerm = i
+								break
+							}
+						}
+
+						if lastEntryWithConflictTerm != -1 {
+							rf.nextIndex[server] = lastEntryWithConflictTerm + 1
+						} else {
+							rf.nextIndex[server] = reply.ConflictIndex
+						}
+					}
+
+					// Ensure nextIndex doesn't go below 1
+					if rf.nextIndex[server] < 1 {
+						rf.nextIndex[server] = 1
+					}
 				}
 			}
 		}(i)
@@ -464,14 +600,19 @@ func (rf *Raft) ticker() {
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	return index, term, isLeader
+	if rf.state != Leader {
+		return -1, rf.currentTerm, false
+	}
+
+	index := len(rf.log)
+	term := rf.currentTerm
+	rf.log = append(rf.log, LogEntry{Term: term, Index: index, Command: command})
+	rf.persist()
+
+	return index, term, true
 }
 
 // the tester calls Kill() when a Raft instance won't
@@ -517,7 +658,35 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// main Goroutine of Raft to manage the timer of election
 	go rf.ticker()
-	// Your initialization code here (2A, 2B, 2C).
+
+	rf.applyCh = applyCh
+	rf.applierCond = sync.NewCond(&rf.mu)
+	go rf.applier()
 
 	return rf
+}
+
+func (rf *Raft) applier() {
+	for !rf.killed() {
+		rf.mu.Lock()
+		for rf.lastApplied >= rf.commitIndex {
+			rf.applierCond.Wait()
+		}
+
+		commitIndex := rf.commitIndex
+		lastApplied := rf.lastApplied
+
+		entries := make([]LogEntry, commitIndex-lastApplied)
+		copy(entries, rf.log[lastApplied+1:commitIndex+1])
+
+		rf.lastApplied = commitIndex
+		rf.mu.Unlock()
+
+		for _, entry := range entries {
+			rf.applyCh <- ApplyMsg{
+				Command: entry.Command,
+				Index:   entry.Index,
+			}
+		}
+	}
 }
